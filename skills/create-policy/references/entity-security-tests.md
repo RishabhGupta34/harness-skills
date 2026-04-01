@@ -8,6 +8,9 @@
 
 The security tests input is an **array** at the root level. Two main items:
 
+- **Index 0** (`name: "output"`): Contains `outcome.outputVariables` with summary counts (strings).
+- **Index 1** (`name: "securityTestData"`): Contains `outcome.issues[]` — the array of vulnerability issues.
+
 ```
 input[i].name == "output"
 input[i].outcome.outputVariables.CRITICAL        # string count
@@ -25,16 +28,34 @@ input[i].outcome.outputVariables.BASE_HIGH
 input[i].outcome.outputVariables.BASE_IMAGE_APPROVED  # "true"/"false"
 
 input[i].name == "securityTestData"
-input[i].outcome.issues[j].id
+input[i].outcome.issues[j].created               # Unix timestamp in seconds (e.g. 1770127130)
+input[i].outcome.issues[j].id                    # Unique issue ID string
+input[i].outcome.issues[j].issueType             # "SCA", "SAST", "DAST", etc.
+input[i].outcome.issues[j].key                   # Issue key (e.g. "pyyaml//3.13")
 input[i].outcome.issues[j].title
-input[i].outcome.issues[j].severityCode          # "Critical", "High", "Medium", "Low", "Info"
-input[i].outcome.issues[j].occurrences[k]        # array
-input[i].outcome.issues[j].details.referenceIdentifiers[l].id    # e.g. "CVE-2023-12345"
-input[i].outcome.issues[j].details.referenceIdentifiers[l].type  # "cve", "cwe"
-input[i].outcome.issues[j].details.epss.score
-input[i].outcome.issues[j].details.epss.percentile
-input[i].outcome.issues[j].reachability          # "reachable", "not_reachable", "unknown"
+input[i].outcome.issues[j].numOccurrences        # Integer count
+input[i].outcome.issues[j].occurrences[k]        # array of occurrence details
+input[i].outcome.issues[j].details.severityCode  # "Critical", "High", "Medium", "Low", "Info" (Title Case)
+input[i].outcome.issues[j].details.severity      # Numeric CVSS score (e.g. 9.8)
+input[i].outcome.issues[j].details.title         # Package identifier (e.g. "pkg:pypi/pyyaml@3.13")
+input[i].outcome.issues[j].details.issueDescription  # Vulnerability description
+input[i].outcome.issues[j].details.libraryName   # Affected library
+input[i].outcome.issues[j].details.currentVersion    # Current version string
+input[i].outcome.issues[j].details.referenceIdentifiers[l].id    # WITHOUT prefix, e.g. "2020-14343" (NOT "CVE-2020-14343")
+input[i].outcome.issues[j].details.referenceIdentifiers[l].type  # "cve", "cwe", "ghsa"
+input[i].outcome.issues[j].details.epss          # EPSS score (float)
+input[i].outcome.issues[j].details.epssPercentile # EPSS percentile (float)
+input[i].outcome.issues[j].details.reachability  # "reachable", "unreachable", "unknown"
+input[i].outcome.issues[j].details.productName   # Scanner product name
 ```
+
+### IMPORTANT RULES for security test policies:
+1. Access issues via `input[1].outcome.issues[_]` since the input root is a plain array.
+2. **Always use `issue.details.severityCode`** for severity checks, NOT `issue.severityCode`.
+3. Severity values are **Title Case**: `"Critical"`, `"High"`, `"Medium"`, `"Low"` — never lowercase.
+4. CVE IDs do NOT have a `"CVE-"` prefix — they are bare like `"2020-14343"`.
+5. EPSS fields are flat: `issue.details.epss` and `issue.details.epssPercentile` (NOT nested under `.score`/`.percentile`).
+6. Reachability is under `issue.details.reachability`, NOT `issue.reachability`.
 
 ## Example 1: Block by severity
 
@@ -75,7 +96,7 @@ deny_list_violations[violations] {
 deny_compare(issue, rule) := true if {
   str_compare(issue.title, rule.title.operator, rule.title.value)
   num_compare(count(issue.occurrences), rule.maxOccurrences.operator, rule.maxOccurrences.value)
-  str_compare(issue.severityCode, rule.severity.operator, rule.severity.value)
+  str_compare(issue.details.severityCode, rule.severity.operator, rule.severity.value)
   ri_array := default_ri(issue)
   ri := ri_array[l]
   str_compare(ri.id, rule.refId.operator, rule.refId.value)
@@ -163,7 +184,7 @@ deny[msg] {
   input[i].name == "securityTestData"
   reachable_issues := [issue |
     some issue in input[i].outcome.issues
-    issue.reachability == "reachable"
+    issue.details.reachability == "reachable"
   ]
   count(reachable_issues) > maxReachableIssuesCount
   msg := sprintf("Found %d reachable vulnerabilities, maximum allowed is %d", [count(reachable_issues), maxReachableIssuesCount])
@@ -189,9 +210,9 @@ deny[msg] {
     some i, j
     input[i].name == "securityTestData"
     issue := input[i].outcome.issues[j]
-    issue.details.epss.score != null
-    round_off(issue.details.epss.score) > epss_threshold
-    round_off(issue.details.epss.percentile) > epss_percentile_threshold
+    issue.details.epss != null
+    round_off(issue.details.epss) > epss_threshold
+    round_off(issue.details.epssPercentile) > epss_percentile_threshold
   }
   issue_count := count(unique_issue_ids)
   issue_count > max_issues
@@ -241,6 +262,38 @@ num_compare(a, "<=", b) := a <= b
 num_compare(a, ">=", b) := a >= b
 num_compare(a, "<", b) := a < b
 num_compare(a, ">", b) := a > b
+```
+
+## Example 7: Block critical vulnerabilities older than N days
+
+**Scenario:** Deny if any critical vulnerability has a CVE age exceeding 30 days.
+
+```rego
+package securityTests
+
+# Maximum allowed age in days for critical vulnerabilities
+max_critical_age_days = 30
+
+# Seconds in a day
+seconds_per_day = 86400
+
+# Deny if any critical vulnerability is older than the max allowed age
+deny[msg] {
+  # Access issues from the securityTestData entry (index 1)
+  issue = input[1].outcome.issues[_]
+
+  # Check for Critical severity (Title Case, under details)
+  issue.details.severityCode == "Critical"
+
+  # Calculate age in days from the unix timestamp
+  age_in_days = (time.now_ns() / 1000000000 - issue.created) / seconds_per_day
+  age_in_days > max_critical_age_days
+
+  msg := sprintf(
+    "Critical vulnerability '%s' (CVSS: %v) is %.0f days old, exceeding the maximum allowed age of %d days",
+    [issue.details.title, issue.details.severity, age_in_days, max_critical_age_days]
+  )
+}
 ```
 
 ## Key Notes
